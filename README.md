@@ -1,6 +1,10 @@
 # asteriskWatch
 asteriskWatch is an library for easily get current full asterisk extension status.
 
+## About
+
+This library processes events of Newstate, ExtensionStatus and Dial. Collects and keeps the status by each number. Is able to process readdressing, group calls and conferences.
+
 ## Requires
 
 PHP 5.3 or Higher
