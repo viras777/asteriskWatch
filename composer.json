@@ -1,5 +1,5 @@
 {
-    "name": "viras777/asteriskWatch",
+    "name": "viras777/asteriskwatch",
     "description": "Traces a condition of extensions through asterisk AMI and gives stateful status",
     "keywords": ["AMI","asterisk","status"],
     "type": "library",
