@@ -28,29 +28,24 @@ class asteriskWatch
 	 *
 	 * @var string
 	 */
-	const VERSION = '1.1.0';
+	const VERSION = '1.4.5';
 	
 	/**
 	 * No logging.
-	 *
-	 * @var int
 	 */
 	public const logNone = 0;
-
 	/**
 	 * Log only sendDial event.
-	 *
-	 * @var int
 	 */
 	public const logInfo = 1;
-
-
 	/**
-	 * Log full, sendDial && internal status
-	 *
-	 * @var int
+	 * Log sendDial, internal status
 	 */
 	public const logDebug = 2;
+	/**
+	 * Log sendDial, internal status, trace variables
+	 */
+	public const logTrace = 3;
 
 	# -1 = Екстеншен не найден
 	# 0 = Idle
@@ -83,10 +78,10 @@ class asteriskWatch
 		self::extenStatusInUse => 'Разговаривает',
 		self::extenStatusBusy => 'Занято',
 		self::extenStatusUnavailable => 'Недоступно',
-		self::extenStatusRinging => 'Звонит',
+		self::extenStatusRinging => 'Вызов',
 		self::extenStatusOnHold => 'На удержании',
 		self::extenStatusInUseRedir => 'Разговаривает (переадресация)',
-		self::extenStatusRingingRedir => 'Звонит (переадресация)',
+		self::extenStatusRingingRedir => 'Вызов (переадресация)',
 		self::extenStatusBusyRedir => 'Занято (переадресация)'
 		];
 		
@@ -107,11 +102,25 @@ class asteriskWatch
 	private const ChannelState = [0 => 0, 1 => 0, 2 => 4, 3 => 8, 4 => 8, 5 => 8, 6 => 1, 7 => 2, 8 => 8, 9 => 0, 10 => -1];
 	public $Debug = self::logNone;
 
-	#   Redir Status
+	#  Redir Status
 	# AddRedir		- добавили будущий редирект к номеру
 	# RingRedir		- зазвонил редирект
-	# ConnRedir		- произошло соединение с редиректом
 
+	# DialStatus
+	public const DialStatusTxt = [
+		'ANSWER' => 'Вызов отвечен',
+		'BUSY' => 'Номер занят',
+		'NOANSWER' => 'На вызов не ответили',
+		'CANCEL' => 'Вызов отменен',
+		'CONGESTION' => 'Канал перегружен',
+		'CHANUNAVAIL' => 'Канал недоступен',
+		'DONTCALL' => 'Вызов отклонён',
+		'TORTURE' => 'Голосовое меню',
+		'INVALIDARGS' => 'Неправильный номер',
+		'VOICEMAIL' => 'Голосовая почта',
+		'REDIREND' => 'Переадресации завершена'
+		];
+		
 	# File pointer to asterisk socket
 	private $fp = false;
 
@@ -141,9 +150,18 @@ class asteriskWatch
 	#	[Status] =>
 	private $extenListRedirID = [];
 
+	# Assoc array: [UniqueID] = From, To
+	private $extenListCheckBusy = [];
+
+	# magic const for cleanExten, temp lineNum
+	private const magicLineNum = -1;
+	
 	# Array of initial exten
 	private $initExten = [];
 
+	# Callable function array
+	private $callbackFunc = [];
+	
 	public function __construct($host = '127.0.0.1', $port = 5038, $user = '', $pass = '')
 	{
 		$this->host = $host;
@@ -153,54 +171,138 @@ class asteriskWatch
 		return $this->connect();
 	}
 
-	public function setExtenList($arr) {
-		$this->initExten = [];
-		foreach ($arr as $exten) {
+	public function setExtenList($newSet) {
+		foreach(array_diff($newSet, $this->initExten) as $exten) {
+			$this->log("Add exten: {$exten}".PHP_EOL, self::logDebug);
 			$this->initExten[] = $exten;
+			$this->cleanExten($exten, 0);
 		}
+		foreach(array_diff($this->initExten, $newSet) as $index => $exten) {
+			$this->log("Del exten: {$index}:{$exten}".PHP_EOL, self::logDebug);
+			unset($this->initExten[$index]);
+			if (isset($this->extenList[$exten])) {
+				unset($this->extenList[$exten]);
+			}
+			fclose($this->fp);
+		}
+	}
+
+	public function setFuncSendDialEvent($func) {
+        if (!is_callable($func)) {
+            $this->log(new Exception("function not callable".PHP_EOL), self::logInfo);
+            return false;
+        }
+		$this->callbackFunc['sendDialEvent'] = $func;
+	}
+	
+	public function setFuncSaveCDR($func) {
+        if (!is_callable($func)) {
+            $this->log(new Exception("function not callable".PHP_EOL), self::logInfo);
+            return false;
+        }
+		$this->callbackFunc['saveCDR'] = $func;
+	}
+	
+	public function setFuncTick($func) {
+        if (!is_callable($func)) {
+            $this->log(new Exception("function not callable".PHP_EOL), self::logInfo);
+            return false;
+        }
+		$this->callbackFunc['tick'] = $func;
 	}
 	
 	public function watch()
 	{
-		if (false === $this->fp) {
-			return false;
-		}
-
 		while (true) {
-			unset($extenListChannelID);
-			unset($extenListCallID);
-			unset($extenListRedirID);
-			$extenListChannelID = [];
-			$extenListCallID = [];
-			$extenListRedirID = [];
+			$this->extenListChannelID = [];
+			$this->extenListCallID = [];
+			$this->extenListRedirID = [];
+			$this->extenList = [];
+			$this->extenListCheckBusy = [];
 			# Get list of monitoring exten.
 			foreach ($this->initExten as $exten) {
 				$this->cleanExten($exten, 0);
 			}
-
-			# Get exten status
-			foreach ($this->extenList as $exten => &$properties) {
-				fwrite($this->fp, "Action: ExtensionState\r\n");
-				fwrite($this->fp, "ActionID: {$this->actionID}\r\n");
-				fwrite($this->fp, "Exten: {$exten}\r\n");
-				fwrite($this->fp, "\r\n");
-				$this->getAsteriskBlock();
-				$this->log("event ->\n", $this->answer, self::logDebug, 1);
-				$properties['0']['Status'] = $this->answer['Status'];
-				$properties['0']['StatusTxt'] = $this->getStatusTxt($properties['0']['Status']);
-				$this->sendDialEvent(['Exten' => $exten, 'LineNum' => 0 ]);
-			}
-			unset($properties);
 			$this->logStatus('Start from here.', self::logDebug);
-			
+
 			# Main loop
-			while (!feof($this->fp)) {
+			while (is_resource($this->fp) && !feof($this->fp)) {
 				$this->actionID = '';
 				$this->getAsteriskBlock();
 				switch ($this->answer['Event']) {
+					case 'Newchannel':
+						if ($this->answer['CallerIDNum'] == '' || $this->answer['Exten'] == ''
+								|| isset($this->extenListCheckBusy[$this->answer['Uniqueid']])) {
+							break;
+						}
+						$this->extenListCheckBusy[$this->answer['Uniqueid']]['From'] = $this->answer['CallerIDNum'];
+						$this->extenListCheckBusy[$this->answer['Uniqueid']]['To'] = $this->answer['Exten'];
+						break;
+					case 'Hangup':
+						# Завершение отслеживания звонка может быть тут(ivr), Newstate(busy) и Dial
+						if (isset($this->extenListCheckBusy[$this->answer['Uniqueid']])) {
+							unset($this->extenListCheckBusy[$this->answer['Uniqueid']]);
+						}
+						break;
 					case 'Newstate':
+						if (isset($this->extenListCheckBusy[$this->answer['Uniqueid']]) && self::extenStatusBusy == self::ChannelState[$this->answer['ChannelState']]) {
+							$from = $this->extenListCheckBusy[$this->answer['Uniqueid']]['From'];
+							$to = $this->extenListCheckBusy[$this->answer['Uniqueid']]['To'];
+							if (isset($this->extenList[$from])) {
+								$this->cleanExten($from, self::magicLineNum);
+								$this->extenList[$from][self::magicLineNum]['Status'] = self::extenStatusBusy;
+								$this->extenList[$from][self::magicLineNum]['StatusTxt'] = $this->getStatusTxt(self::extenStatusBusy);
+								$this->extenList[$from][self::magicLineNum]['From'] = $from;
+								$this->extenList[$from][self::magicLineNum]['To'] = $to;
+								$this->extenList[$from][self::magicLineNum]['Direction'] = 'out';
+								$this->extenList[$from][self::magicLineNum]['CallTimeFrom'] = time();
+								if (isset($this->extenList[$to])) {
+									$this->extenList[$from][self::magicLineNum]['SecondSideExten'] = $to;
+								} else {
+									$this->extenList[$from][self::magicLineNum]['SecondSideExten'] = 0;
+								}
+								$this->extenList[$from][self::magicLineNum]['SecondSideLineNum'] = 0;
+								$this->extenList[$from][self::magicLineNum]['CallerIDName'] = $this->answer['CallerIDName'];
+								$this->extenList[$from][self::magicLineNum]['UniqueID'] = $this->answer['Uniqueid'];
+								$this->sendDialEvent(['Exten' => $from, 'LineNum' => self::magicLineNum,
+													'CallTimeTo' => time(), 'EndCallStatus' => 'BUSY', 
+													'EndCallStatusTxt' => self::DialStatusTxt['BUSY'] ]);
+								$this->saveCDR(['Exten' => $from, 'LineNum' => self::magicLineNum,
+												'CallTimeTo' => time(), 'EndCallStatus' => 'BUSY']);
+								unset($this->extenList[$from][self::magicLineNum]);
+							}
+							if (isset($this->extenList[$to])) {
+								$this->cleanExten($to, self::magicLineNum);
+								$this->extenList[$to][self::magicLineNum]['Status'] = self::extenStatusBusy;
+								$this->extenList[$to][self::magicLineNum]['StatusTxt'] = $this->getStatusTxt(self::extenStatusBusy);
+								$this->extenList[$to][self::magicLineNum]['From'] = $from;
+								$this->extenList[$to][self::magicLineNum]['To'] = $to;
+								$this->extenList[$to][self::magicLineNum]['Direction'] = 'in';
+								$this->extenList[$to][self::magicLineNum]['CallTimeFrom'] = time();
+								if (isset($this->extenList[$from])) {
+									$this->extenList[$to][self::magicLineNum]['SecondSideExten'] = $from;
+								} else {
+									$this->extenList[$to][self::magicLineNum]['SecondSideExten'] = 0;
+								}
+								$this->extenList[$to][self::magicLineNum]['SecondSideLineNum'] = 0;
+								$this->extenList[$to][self::magicLineNum]['CallerIDName'] = $this->answer['CallerIDName'];
+								$this->extenList[$to][self::magicLineNum]['UniqueID'] = $this->answer['Uniqueid'];
+								$this->sendDialEvent(['Exten' => $to, 'LineNum' => self::magicLineNum,
+													'CallTimeTo' => time(), 'EndCallStatus' => 'BUSY', 
+													'EndCallStatusTxt' => self::DialStatusTxt['BUSY'] ]);
+								if (!isset($this->extenList[$from])) {
+									$this->saveCDR(['Exten' => $to, 'LineNum' => self::magicLineNum,
+												'CallTimeTo' => time(), 'EndCallStatus' => 'BUSY']);
+								}
+								unset($this->extenList[$to][self::magicLineNum]);
+							}
+							unset($this->extenListCheckBusy[$this->answer['Uniqueid']]);
+							break;
+						}
+						# break не нужен, т.к. продолжаем ниже
 					case 'ExtensionStatus':
 						$lineNum = 0;
+						$uid = 0;
 						if ('Newstate' == $this->answer['Event']) {
 							# Тут мы смотрим статус того екстеншена, куда звонит целевой
 							if (!isset($this->extenListCallID[$this->answer['Uniqueid']])) {
@@ -211,8 +313,25 @@ class asteriskWatch
 							if (!isset($this->extenListChannelID[$channelID]) || !isset($this->extenListCallID[$this->extenListChannelID[$channelID]])) {
 								break;
 							}
-							$exten = $this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten'];
-							$lineNum = $this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum'];
+							$exten = $this->extractExten($this->answer['Channel']);
+							if ($exten == false) {
+								$exten = $this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten'];
+								$lineNum = $this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum'];
+							} else {
+								# Взять из события номер линии никак, найдём второй екстен, зайдём в него и там посмотрим SecondSideLineNum
+								if ($exten == $this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten']) {
+									$lineNum = $this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum'];
+								} elseif (isset($this->extenList[$this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten']][$this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum']]['SecondSideExten'])
+											&& '0' != $this->extenList[$this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten']][$this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum']]['SecondSideExten']) {
+									# Аналогично этому:
+									#$_exten = $this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten'];
+									#$_lineNum = $this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum'];
+									#$lineNum = $this->extenList[$_exten][$_lineNum]['SecondSideLineNum'];
+									$lineNum = $this->extenList[$this->extenListCallID[$this->extenListChannelID[$channelID]]['Exten']][$this->extenListCallID[$this->extenListChannelID[$channelID]]['LineNum']]['SecondSideLineNum'];
+								} else {
+									break;
+								}
+							}
 						} elseif ('ExtensionStatus' == $this->answer['Event']) {
 							# Тут мы смотрим целевой екстеншен
 							$exten = $this->answer['Exten'];
@@ -224,23 +343,33 @@ class asteriskWatch
 							}
 							reset($this->extenListRedirID[$exten]);
 							$lineNum = key($this->extenListRedirID[$exten]);
-							if (isset($this->extenListRedirID[$exten][$lineNum]) 
-									&& $exten != $this->extenListRedirID[$exten][$lineNum]['MainExten']
-									&& !isset($this->extenList[$exten])) {
-								$this->extenListRedirID[$exten][$lineNum]['Status'] = $status;
-								break;
-							}
+							$uid = $this->extenListRedirID[$exten][$lineNum]['UniqueID'];
 						} else {
 							break;
 						}
-						$this->log('TEST event ->', $this->answer, self::logDebug);
 						if (!isset($this->extenListRedirID[$exten][$lineNum])) {
 							break;
 						}
 						$mainExten = $this->extenListRedirID[$exten][$lineNum]['MainExten'];
 						$mainLineNum = $this->extenListRedirID[$exten][$lineNum]['MainExtenLineNum'];
+						# Заранее предположим кто ответил
+						if (isset($this->answer['ConnectedLineNum'])) {
+							$answeredExten = $this->extractExten($this->answer['ConnectedLineNum']);
+							if ($answeredExten === false) {
+								$answeredExten = $exten;
+							}
+						} else {
+							$answeredExten = $exten;
+						}
+						if (isset($this->extenList[$mainExten][$mainLineNum])) {
+							if ($this->extenList[$mainExten][$mainLineNum]['From'] == $answeredExten) {
+								$answeredExten = $this->extenList[$mainExten][$mainLineNum]['To'];
+							}
+						}
+						$this->log("Newstate01: exten={$exten} lineNum={$lineNum} status={$status} channelID={$channelID} mainExten={$mainExten} mainLineNum={$mainLineNum} uid={$uid} answeredExten={$answeredExten}".PHP_EOL, self::logTrace);
 						# Если основной exten уже в этом статусе, то только меняем статус текущего exten
-						if (($this->extenList[$mainExten][$mainLineNum]['Status'] & self::extenStatusMaskStd) == $status 
+						if (isset($this->extenList[$exten][$lineNum]) && isset($this->extenList[$mainExten][$mainLineNum]) 
+								&& ($this->extenList[$mainExten][$mainLineNum]['Status'] & self::extenStatusMaskStd) == $status 
 								&& $this->extenList[$mainExten][$mainLineNum]['To'] == $exten) {
 							$this->extenListRedirID[$exten][$lineNum]['Status'] = $status;
 							# Обновим статус у связанных exten
@@ -257,33 +386,56 @@ class asteriskWatch
 							$this->logStatus('Changed exten status, main exten status already has same status. Exten='.$exten.' lineNum='.$lineNum.' mainExten='.$mainExten.' mainLineNum='.$mainLineNum, self::logDebug);
 							break;
 						}
-						# Если касается основного соединения. Если статус уже или стал extenStatusIdle, то меняем не тут, а в евенте Dial
-						if ((isset($this->extenList[$exten]) || $this->extenList[$mainExten][$mainLineNum]['To'] == $exten)
+						# Если касается основного соединения. Если статус уже или стал extenStatusIdle, то меняем НЕ тут, а в евенте Dial
+						if ((isset($this->extenList[$exten][$lineNum]) && $exten == $mainExten && $this->extenList[$mainExten][$mainLineNum]['To'] == $exten)
 								&& (self::extenStatusIdle != $this->extenList[$mainExten][$mainLineNum]['Status'] && self::extenStatusIdle != $status)) {
 							if (($this->extenList[$mainExten][$mainLineNum]['Status'] & self::extenStatusMaskStd) != $status) {
 								if ($this->extenList[$mainExten][$mainLineNum]['To'] == $exten) {
 									$newStatus = $status;
 								} else {
-									# Новый статус в стандартных битах только, остальные сохраним как было
-									$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenList[$mainExten][$mainLineNum]['Status']);
+									# Новый статус в стандартных битах только, остальные сохраним как было, 
+									# за исключением комбинации редиректа с InUse, Busy, Ringing
+									if (($this->extenList[$mainExten][$mainLineNum]['Status'] & (self::extenStatusInUse | self::extenStatusInUseRedir)) ==
+											(self::extenStatusInUse | self::extenStatusInUseRedir) ||
+										($this->extenList[$mainExten][$mainLineNum]['Status'] & (self::extenStatusBusy | self::extenStatusBusyRedir)) ==
+											(self::extenStatusBusy | self::extenStatusBusyRedir) ||
+										($this->extenList[$mainExten][$mainLineNum]['Status'] & (self::extenStatusRinging | self::extenStatusRingingRedir)) ==
+											(self::extenStatusRinging | self::extenStatusRingingRedir)) {
+										if ($status == self::extenStatusInUse) {
+											$newStatus = (self::extenStatusInUse | self::extenStatusInUseRedir);
+										} elseif ($status == self::extenStatusBusy) {
+											$newStatus = (self::extenStatusBusy | self::extenStatusBusyRedir);
+										} elseif ($status == self::extenStatusRinging) {
+											$newStatus = (self::extenStatusRinging | self::extenStatusRingingRedir);
+										} else {
+											$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenList[$mainExten][$mainLineNum]['Status']);
+										}
+									} else {
+										$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenList[$mainExten][$mainLineNum]['Status']);
+									}
 								}
 								if ('' == $this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] && self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd)) {
 									$this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] = time();
-									$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $exten;
+									$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $answeredExten;
 								}
 								$this->extenListRedirID[$exten][$lineNum]['Status'] = $newStatus;
 								$this->extenListRedirID[$mainExten][$mainLineNum]['Status'] = $newStatus;
 								$this->extenList[$mainExten][$mainLineNum]['Status'] = $newStatus;
 								$this->extenList[$mainExten][$mainLineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
+								if (isset($this->extenList[$exten][$lineNum])) {
+									$this->extenList[$exten][$lineNum]['Status'] = $newStatus;
+									$this->extenList[$exten][$lineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
+								}
 								# Повторим тоже самое для secondSideExten
 								$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 								$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+								$this->log("Newstate02: newStatus={$newStatus} secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 								if (0 != $secondSideExten && isset($this->extenList[$secondSideExten][$secondLineNum])
 										&& ($this->extenList[$secondSideExten][$secondLineNum]['Status'] & self::extenStatusMaskStd) != $status) {
 									$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenList[$secondSideExten][$secondLineNum]['Status']);
 									if ('' == $this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] && self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd)) {
 										$this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] = time();
-										$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $exten;
+										$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $answeredExten;
 									}
 									$this->extenList[$secondSideExten][$secondLineNum]['Status'] = $newStatus;
 									$this->extenList[$secondSideExten][$secondLineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
@@ -294,13 +446,12 @@ class asteriskWatch
 									$uid = $this->extenListChannelID[$channelID];
 								} elseif (isset($this->answer['Uniqueid'])) {
 									$uid = $this->answer['Uniqueid'];
-								} else {
-									$uid = 0;
 								}
 								if ($uid != 0) {
 									foreach ($this->extenListRedirID as $to => $properties) {
 										foreach ($properties as $line => $lineProperties) {
 											if ($lineProperties['UniqueID'] == $uid) {
+												$this->log("Newstate03: change status to={$to} line={$line} status={$status} uid={$uid}".PHP_EOL, self::logTrace);
 												$this->extenListRedirID[$to][$line]['Status'] = $status;
 											}
 										}
@@ -318,8 +469,26 @@ class asteriskWatch
 								if (self::extenStatusIdle == $status) {
 									$newStatus = $status;
 								} else {
-									# Новый статус в стандартных битах только, остальные сохраним как было
-									$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenListRedirID[$exten][$lineNum]['Status']);
+									# Новый статус в стандартных битах только, остальные сохраним как было, 
+									# за исключением комбинации редиректа с InUse, Busy, Ringing
+									if (($this->extenListRedirID[$exten][$lineNum]['Status'] & (self::extenStatusInUse | self::extenStatusInUseRedir)) ==
+											(self::extenStatusInUse | self::extenStatusInUseRedir) ||
+										($this->extenListRedirID[$exten][$lineNum]['Status'] & (self::extenStatusBusy | self::extenStatusBusyRedir)) ==
+											(self::extenStatusBusy | self::extenStatusBusyRedir) ||
+										($this->extenListRedirID[$exten][$lineNum]['Status'] & (self::extenStatusRinging | self::extenStatusRingingRedir)) ==
+											(self::extenStatusRinging | self::extenStatusRingingRedir)) {
+										if ($status == self::extenStatusInUse) {
+											$newStatus = (self::extenStatusInUse | self::extenStatusInUseRedir);
+										} elseif ($status == self::extenStatusBusy) {
+											$newStatus = (self::extenStatusBusy | self::extenStatusBusyRedir);
+										} elseif ($status == self::extenStatusRinging) {
+											$newStatus = (self::extenStatusRinging | self::extenStatusRingingRedir);
+										} else {
+											$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenListRedirID[$exten][$lineNum]['Status']);
+										}
+									} else {
+										$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenListRedirID[$exten][$lineNum]['Status']);
+									}
 								}
 								$this->extenListRedirID[$exten][$lineNum]['Status'] = $newStatus;
 								$count = 0;
@@ -330,6 +499,7 @@ class asteriskWatch
 										}
 									}
 								}
+								$this->log("Newstate04: newStatus={$newStatus} count={$count}".PHP_EOL, self::logTrace);
 								# Если куча редиректов у основного екстеншена, то меняем статус екстеншену не при любом статусе
 								# Если отвалился редирект, стал Idle
 								if ($count > 1 && self::extenStatusIdle == $newStatus) {
@@ -348,10 +518,11 @@ class asteriskWatch
 									break;
 								}
 								# Если зазвонил редирект
-								elseif ($count > 1 && self::extenStatusRinging == ($newStatus & self::extenStatusMaskStd)) {
+								if ($count > 1 && self::extenStatusRinging == ($newStatus & self::extenStatusMaskStd)) {
 									$newStatus |= self::extenStatusRingingRedir;
 									$this->extenListRedirID[$exten][$lineNum]['Status'] = $newStatus;
 									if (isset($this->extenList[$exten])) {
+										$this->log("Newstate05: cleanExten exten={$exten} lineNum={$lineNum}".PHP_EOL, self::logTrace);
 										$this->cleanExten($exten, $lineNum);
 										$this->extenList[$exten][$lineNum]['From'] = $this->extenList[$mainExten][$mainLineNum]['From'];
 										$this->extenList[$exten][$lineNum]['To'] = $this->extenList[$mainExten][$mainLineNum]['To'];
@@ -360,12 +531,12 @@ class asteriskWatch
 											$this->extenList[$exten][$lineNum]['Direction'] = ('in' == $this->extenList[$mainExten][$mainLineNum]['Direction'] ? 'out' : 'in');
 											$this->extenList[$exten][$lineNum]['SecondSideExten'] = $mainExten;
 											$this->extenList[$exten][$lineNum]['SecondSideLineNum'] = $mainLineNum;
-										}
-										else {
+										} else {
 											$this->extenList[$exten][$lineNum]['Direction'] = $this->extenList[$mainExten][$mainLineNum]['Direction'];
 											$this->extenList[$exten][$lineNum]['SecondSideExten'] = 0;
 											$this->extenList[$exten][$lineNum]['SecondSideLineNum'] = 0;
 										}
+										$this->extenList[$exten][$lineNum]['CallerIDName'] = $this->extenList[$mainExten][$mainLineNum]['CallerIDName'];
 										$this->extenList[$exten][$lineNum]['Status'] = $newStatus;
 										$this->extenList[$exten][$lineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
 										$this->extenList[$exten][$lineNum]['UniqueID'] = $this->extenList[$mainExten][$mainLineNum]['UniqueID'];
@@ -377,36 +548,43 @@ class asteriskWatch
 										'Status' => $newStatus, 'StatusTxt' => $this->getStatusTxt($newStatus),
 										'RingRedir' => $exten ]);
 									$this->logStatus('Changed RedirID exten status to Ringing. mainExten='.$mainExten.' mainLineNum='.$mainLineNum.' RingRedir(exten)='.$exten, self::logDebug);
+									break;
 								}
+								$pass = 0;
 								# Если стало занято или начат разговор в редиректе
-								elseif ($count > 1 && (self::extenStatusBusy == $newStatus || self::extenStatusInUse == $newStatus)) {
-									if (self::extenStatusBusy == $newStatus) {
-										$newStatus = ($this->extenList[$mainExten][$mainLineNum]['Status'] & self::extenStatusMaskStd) | self::extenStatusBusyRedir;
-									}
-									if (self::extenStatusInUse == $newStatus) {
-										if (false != $channelID) {
-											$uid = $this->extenListChannelID[$channelID];
-										} elseif (isset($this->answer['Uniqueid'])) {
-											$uid = $this->answer['Uniqueid'];
-										} else {
-											$uid = 0;
-										}
-										$pass = 1;
-										if (0 != $uid) {
-											$to = $this->extenList[$mainExten][$mainLineNum]['To'];
-											foreach ($this->extenListRedirID[$to] as $line => $properties) {
-												if ($uid == $properties['UniqueID']) {
-													$pass = 0;
-													break;
-												}
-											}
-										}
-										if ($pass == 1) {
+								if ($count > 1 && (self::extenStatusBusy == ($newStatus & self::extenStatusMaskStd) 
+														|| self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd))) {
+									$pass = 1;
+								}
+								# Если остался только 1 редирект у екстеншена (может быть и сам екстеншен остался)
+								# extenStatusIdle будем обрабатывать только в событии Dial
+								elseif (1 == $count && self::extenStatusIdle != $newStatus) {
+									$pass = 1;
+								}
+								if ($pass > 0) {
+									$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
+									$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+									if ($this->extenList[$mainExten][$mainLineNum]['To'] != $answeredExten) {
+										if (self::extenStatusInUse == $newStatus) {
 											$newStatus |= self::extenStatusInUseRedir;
 										}
-										if ('' == $this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom']) {
-											$this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] = time();
-											$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $exten;
+										if (self::extenStatusBusy == $newStatus) {
+											$newStatus |= self::extenStatusBusyRedir;
+										}
+										if (self::extenStatusRinging == $newStatus) {
+											$newStatus |= self::extenStatusRingingRedir;
+										}
+									}
+									$this->log("Newstate06: newStatus={$newStatus} exten={$exten} mainExten={$mainExten} pass={$pass} answeredExten={$answeredExten}".PHP_EOL, self::logTrace);
+									if ('' == $this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] 
+											&& self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd)) {
+										$this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] = time();
+										$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $answeredExten;
+										if ($mainExten != $exten) {
+											if (isset($this->extenList[$exten])) {
+												$this->extenList[$exten][$lineNum]['TalkTimeFrom'] = time();
+												$this->extenList[$exten][$lineNum]['AnsweredExten'] = $this->extenList[$mainExten][$mainLineNum]['AnsweredExten'];
+											}
 										}
 									}
 									if ($this->extenList[$mainExten][$mainLineNum]['Status'] != $newStatus) {
@@ -417,79 +595,29 @@ class asteriskWatch
 												$this->extenListRedirID[$this->extenList[$mainExten][$mainLineNum]['From']][$line]['Status'] = $this->extenList[$mainExten][$mainLineNum]['Status'];
 											}
 										}
-										$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
-											'TalkRedir' => $exten ]);
-										$this->logStatus('Changed main RedirID exten status. mainExten='.$mainExten.' mainLineNum='.$mainLineNum.' exten='.$exten, self::logDebug);
+										if ($mainExten != $exten && isset($this->extenList[$exten])) {
+											$this->extenList[$exten][$lineNum]['Status'] = $newStatus;
+											$this->extenList[$exten][$lineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
+										}
+										$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum ]);
+										if ($mainExten != $exten && isset($this->extenList[$exten])) {
+											$this->sendDialEvent(['Exten' => $exten, 'LineNum' => $lineNum ]);
+										}
+										$this->logStatus('Changed RedirID exten status. mainExten='.$mainExten.' mainLineNum='.$mainLineNum.' exten='.$exten.' lineNum='.$lineNum. ' newStatus='.$newStatus, self::logDebug);
 									}
 									# Повторим тоже самое для secondSideExten
-									$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
-									$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
-									if (isset($this->extenList[$secondSideExten][$secondLineNum])
-											&& ($this->extenList[$secondSideExten][$secondLineNum]['Status'] & self::extenStatusMaskStd) != $status) {
-										$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenList[$secondSideExten][$secondLineNum]['Status']);
-										if (self::extenStatusBusy == $newStatus) {
-											$newStatus = ($this->extenList[$secondSideExten][$secondLineNum]['Status'] & self::extenStatusMaskStd) | self::extenStatusBusyRedir;
-										}
-										if (self::extenStatusInUse == $newStatus) {
-											$newStatus |= self::extenStatusInUseRedir;
-											if ('' == $this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom']) {
-												$this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] = time();
-												$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $exten;
-											}
+									$this->log("Newstate07: mainExten={$mainExten} mainLineNum={$mainLineNum} secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
+									if (isset($this->extenList[$secondSideExten][$secondLineNum])) {
+										if ('' == $this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom']
+												&& self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd)) {
+											$this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] = time();
+											$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $this->extenList[$mainExten][$mainLineNum]['AnsweredExten'];
 										}
 										if ($this->extenList[$secondSideExten][$secondLineNum]['Status'] != $newStatus) {
 											$this->extenList[$secondSideExten][$secondLineNum]['Status'] = $newStatus;
 											$this->extenList[$secondSideExten][$secondLineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
-											$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum,
-												'TalkRedir' => $exten ]);
-											$this->logStatus('Changed SecondSide main RedirID exten status. SecondExten='.$secondSideExten.' LineNum='.$secondLineNum.' TalkRedir='.$exten, self::logDebug);
-										}
-									}
-								}
-								# Если остался только 1 редирект у екстеншена (может быть и сам екстеншен остался)
-								# extenStatusIdle будем обрабатывать только в событии Dial
-								elseif (1 == $count && self::extenStatusIdle != $newStatus) {
-									if (($this->extenList[$mainExten][$mainLineNum]['Status'] & self::extenStatusMaskStd) != $status) {
-										if (self::extenStatusInUse == $newStatus && 0 != $this->extenListRedirID[$exten][$mainLineNum]['UniqueID']) {
-											$newStatus |= self::extenStatusInUseRedir;
-										}
-										if (self::extenStatusBusy == $newStatus && 0 != $this->extenListRedirID[$exten][$mainLineNum]['UniqueID']) {
-											$newStatus |= self::extenStatusBusyRedir;
-										}
-										if (self::extenStatusRinging == $newStatus && 0 != $this->extenListRedirID[$exten][$mainLineNum]['UniqueID']) {
-											$newStatus |= self::extenStatusRingingRedir;
-										}
-										if ('' == $this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] && self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd)) {
-											$this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] = time();
-											$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $exten;
-										}
-										$this->extenList[$mainExten][$mainLineNum]['Status'] = $newStatus;
-										$this->extenList[$mainExten][$mainLineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
-										$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum ]);
-										$this->logStatus('Changed RedirID exten status. redirExten='.$exten.' LineNum='.$mainLineNum, self::logDebug);
-										# Повторим тоже самое для secondSideExten
-										$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
-										$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
-										if (isset($this->extenList[$secondSideExten][$secondLineNum])
-												&& ($this->extenList[$secondSideExten][$secondLineNum]['Status'] & self::extenStatusMaskStd) != $status) {
-											$newStatus = $status | ((self::extenStatusMaskStd ^ 255) & $this->extenList[$secondSideExten][$secondLineNum]['Status']);
-											if (self::extenStatusInUse == $newStatus && 0 != $this->extenListRedirID[$exten][$secondLineNum]['UniqueID']) {
-												$newStatus |= self::extenStatusInUseRedir;
-											}
-											if (self::extenStatusBusy == $newStatus && 0 != $this->extenListRedirID[$exten][$secondLineNum]['UniqueID']) {
-												$newStatus |= self::extenStatusBusyRedir;
-											}
-											if (self::extenStatusRinging == $newStatus && 0 != $this->extenListRedirID[$exten][$secondLineNum]['UniqueID']) {
-												$newStatus |= self::extenStatusRingingRedir;
-											}
-											if ('' == $this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] && self::extenStatusInUse == ($newStatus & self::extenStatusMaskStd)) {
-												$this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] = time();
-												$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $exten;
-											}
-											$this->extenList[$secondSideExten][$secondLineNum]['Status'] = $newStatus;
-											$this->extenList[$secondSideExten][$secondLineNum]['StatusTxt'] = $this->getStatusTxt($newStatus);
 											$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum ]);
-											$this->logStatus('Changed RedirID SecondSide exten status. redirExten='.$secondSideExten.' LineNum='.$secondLineNum, self::logDebug);
+											$this->logStatus('Changed SecondSide RedirID exten status. SecondExten='.$secondSideExten.' LineNum='.$secondLineNum, self::logDebug);
 										}
 									}
 								}
@@ -498,6 +626,9 @@ class asteriskWatch
 
 						break;
 					case 'Dial':
+						if (isset($this->extenListCheckBusy[$this->answer['UniqueID']])) {
+							unset($this->extenListCheckBusy[$this->answer['UniqueID']]);
+						}
 						switch ($this->answer['SubEvent']) {
 							case 'Begin':
 								# Extract destination exten
@@ -517,8 +648,7 @@ class asteriskWatch
 								if (!is_numeric($to)) {
 									if (!is_numeric($altTo)) {
 										$to = $exten;
-									}
-									else {
+									} else {
 										$to = $altTo;
 									}
 								}
@@ -552,7 +682,12 @@ class asteriskWatch
 								}
 								if (isset($this->extenList[$from]) && isset($this->extenList[$to])) {
 									$dialDirection = 'out';
+								}
+								# Найдём secondSideExten. Линию secondLineNum найдём позже, сейчас надо знать только наличие второго конца.
+								if (isset($this->extenList[$to]) && $dialDirection == 'out') {
 									$secondSideExten = $to;
+								} elseif (isset($this->extenList[$from]) && $dialDirection == 'in') {
+									$secondSideExten = $from;
 								}
 
 								$mainExten = 0;
@@ -561,7 +696,8 @@ class asteriskWatch
 								# Если звонили с внешнего номера и сработала переадресация, то номер переадресации должен быть в extenListRedirID
 								if (0 == $exten && isset($this->extenListRedirID[$to])) {
 									foreach ($this->extenListRedirID[$to] as $line => $properties) {
-										if ($this->answer['UniqueID'] == $properties['UniqueID']) {
+										if ($this->answer['UniqueID'] == $properties['UniqueID']
+												|| (isset($this->extenListChannelID[$channelID]) && $this->extenListChannelID[$channelID] == $properties['UniqueID'])) {
 											$exten = $to;
 											$lineNum = $line;
 											$mainExten = $properties['MainExten'];
@@ -575,7 +711,8 @@ class asteriskWatch
 								}
 								if (0 == $mainExten && isset($this->extenListRedirID[$exten])) {
 									foreach ($this->extenListRedirID[$exten] as $line => $properties) {
-										if ($this->answer['UniqueID'] == $properties['UniqueID']) {
+										if ($this->answer['UniqueID'] == $properties['UniqueID']
+												|| (isset($this->extenListChannelID[$channelID]) && $this->extenListChannelID[$channelID] == $properties['UniqueID'])) {
 											$lineNum = $line;
 											$mainExten = $properties['MainExten'];
 											$mainLineNum = $properties['MainExtenLineNum'];
@@ -584,6 +721,7 @@ class asteriskWatch
 									}
 								}
 
+								$this->log("Dial01: exten={$exten} lineNum={$lineNum} mainExten={$mainExten} mainLineNum={$mainLineNum} dialDirection={$dialDirection} from={$from} to={$to} secondSideExten={$secondSideExten} secondLineNum={$secondLineNum} channelID={$channelID} destChannelID={$destChannelID}".PHP_EOL, self::logTrace);
 								# Первое вхождение, может быть звонок как К абоненту, так и ОТ абонента
 								if (0 != $exten && !isset($this->extenListCallID[$this->answer['UniqueID']]) 
 										&& !isset($this->extenListChannelID[$channelID])) {
@@ -605,6 +743,7 @@ class asteriskWatch
 											}
 											$lineNum++;
 										}
+										$this->log("Dial02: lineNum={$lineNum}".PHP_EOL, self::logTrace);
 										if (false !== $channelID) {
 											$this->extenListChannelID[$channelID] = $this->answer['UniqueID'];
 										}
@@ -629,6 +768,7 @@ class asteriskWatch
 												}
 												$lineNum2++;
 											}
+											$this->log("Dial03: lineNum2={$lineNum2}".PHP_EOL, self::logTrace);
 											$this->extenListRedirID[$to][$lineNum2]['MainExten'] = $exten;
 											$this->extenListRedirID[$to][$lineNum2]['MainExtenLineNum'] = $lineNum;
 											$this->extenListRedirID[$to][$lineNum2]['UniqueID'] = $this->answer['UniqueID'];
@@ -642,10 +782,26 @@ class asteriskWatch
 												}
 												$lineNum2++;
 											}
+											$this->log("Dial04: lineNum2={$lineNum2}".PHP_EOL, self::logTrace);
 											$this->extenListRedirID[$from][$lineNum2]['MainExten'] = $exten;
 											$this->extenListRedirID[$from][$lineNum2]['MainExtenLineNum'] = $lineNum;
 											$this->extenListRedirID[$from][$lineNum2]['UniqueID'] = $this->answer['UniqueID'];
 											$this->extenListRedirID[$from][$lineNum2]['Status'] = self::extenStatusRinging;
+										}
+										$pass = $this->extractExten($this->answer['Channel']);
+										if ($pass !== false && $from != $pass && $exten != $pass) {
+											$lineNum2 = 0;
+											while (isset($this->extenListRedirID[$pass][$lineNum2])) {
+												if (self::extenStatusIdle == $this->extenListRedirID[$pass][$lineNum2]['Status']) {
+													break;
+												}
+												$lineNum2++;
+											}
+											$this->log("Dial04.1: lineNum2={$lineNum2}".PHP_EOL, self::logTrace);
+											$this->extenListRedirID[$pass][$lineNum2]['MainExten'] = $exten;
+											$this->extenListRedirID[$pass][$lineNum2]['MainExtenLineNum'] = $lineNum;
+											$this->extenListRedirID[$pass][$lineNum2]['UniqueID'] = $this->answer['UniqueID'];
+											$this->extenListRedirID[$pass][$lineNum2]['Status'] = self::extenStatusRinging;
 										}
 										$this->cleanExten($exten, $lineNum);
 										$this->extenList[$exten][$lineNum]['Status'] = self::extenStatusRinging;
@@ -654,7 +810,7 @@ class asteriskWatch
 										$this->extenList[$exten][$lineNum]['To'] = $to;
 										$this->extenList[$exten][$lineNum]['Direction'] = $dialDirection;
 										$this->extenList[$exten][$lineNum]['CallTimeFrom'] = time();
-										$this->extenList[$exten][$lineNum]['SecondSideExten'] = $secondSideExten;
+										$this->extenList[$exten][$lineNum]['SecondSideExten'] = 0;
 										$this->extenList[$exten][$lineNum]['SecondSideLineNum'] = 0;
 										$this->extenList[$exten][$lineNum]['CallerIDName'] = $this->answer['CallerIDName'];
 										$this->extenList[$exten][$lineNum]['UniqueID'] = $this->answer['UniqueID'];
@@ -667,10 +823,12 @@ class asteriskWatch
 												}
 												$secondLineNum++;
 											}
+											$this->log("Dial05: secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 											$this->extenListRedirID[$secondSideExten][$secondLineNum]['MainExten'] = $exten;
 											$this->extenListRedirID[$secondSideExten][$secondLineNum]['MainExtenLineNum'] = $lineNum;
 											$this->extenListRedirID[$secondSideExten][$secondLineNum]['UniqueID'] = $this->answer['UniqueID'];
 											$this->extenListRedirID[$secondSideExten][$secondLineNum]['Status'] = self::extenStatusRinging; 
+											$this->extenList[$exten][$lineNum]['SecondSideExten'] = $secondSideExten;
 											$this->extenList[$exten][$lineNum]['SecondSideLineNum'] = $secondLineNum;
 											$this->cleanExten($secondSideExten, $secondLineNum);
 											$this->extenList[$secondSideExten][$secondLineNum]['Status'] = self::extenStatusRinging;
@@ -705,6 +863,7 @@ class asteriskWatch
 									$this->extenListCallID[$this->answer['DestUniqueID']]['Exten'] = $to;
 									$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 									$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+									$this->log("Dial06: mainExten={$mainExten} mainLineNum={$mainLineNum} to={$to} secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 									$lineNum = 0;
 									while (isset($this->extenListRedirID[$to][$lineNum])) {
 										if ($mainExten == $this->extenListRedirID[$to][$lineNum]['MainExten'] 
@@ -715,6 +874,7 @@ class asteriskWatch
 										}
 										$lineNum++;
 									}
+									$this->log("Dial07: lineNum={$lineNum}".PHP_EOL, self::logTrace);
 									$this->extenListCallID[$this->answer['DestUniqueID']]['LineNum'] = $lineNum;
 									$this->extenListRedirID[$to][$lineNum]['MainExten'] = $mainExten;
 									$this->extenListRedirID[$to][$lineNum]['MainExtenLineNum'] = $mainLineNum;
@@ -727,21 +887,22 @@ class asteriskWatch
 								}
 								$pass = 0;
 								# Если канал уже использовался, то найдём его или если новое соединение в уже зарегистрированном канале
-								if ((!isset($this->extenListRedirID[$exten]) && isset($this->extenListChannelID[$channelID]))
+								# Возможно нужна менее строгая проверка !isset($this->extenListRedirID[$exten]
+								if ((!isset($this->extenListRedirID[$exten][$lineNum]) && isset($this->extenListChannelID[$channelID]))
 										|| (isset($this->extenListChannelID[$channelID]) && !isset($this->extenListCallID[$this->answer['UniqueID']]))) {
 									$uniqueID = $this->extenListChannelID[$channelID];
 									$mainExten = $this->extenListCallID[$uniqueID]['MainExten'];
 									$mainLineNum = $this->extenListCallID[$uniqueID]['MainExtenLineNum'];
-									# Тут специально не надо, будут дубли
-									# $this->extenListChannelID[$destChannelID] = $this->answer['UniqueID'];
+									# Тут специально не надо, будут дубли... Получилась ситуация, когда связи нет, всё равно надо добавлять, но с проверкой.
+									if (!isset($this->extenListChannelID[$destChannelID])) {
+										$this->extenListChannelID[$destChannelID] = $this->answer['UniqueID'];
+									}
 									$this->extenListCallID[$this->answer['UniqueID']]['MainExten'] = $mainExten;
 									$this->extenListCallID[$this->answer['UniqueID']]['MainExtenLineNum'] = $mainLineNum;
 									$this->extenListCallID[$this->answer['UniqueID']]['Exten'] = $to;
 									$this->extenListCallID[$this->answer['UniqueID']]['LineNum'] = $lineNum;
 									$this->logStatus('Find and add redir to main call. mainExten='.$mainExten.' mainLineNum='.$mainLineNum.' exten='.$to.' from='.$from.' to='.$to.' dialDirection='.$dialDirection, self::logDebug);
 									break;
-								}
-								if (isset($this->extenListChannelID[$channelID]) && !isset($this->extenListCallID[$this->answer['UniqueID']])) {
 								}
 								# Заполняем конечные соединения ID'шниками в момент соединения
 								if (isset($this->extenListRedirID[$exten])) {
@@ -752,6 +913,7 @@ class asteriskWatch
 												&& self::extenStatusRinging == $this->extenListRedirID[$exten][$line]['Status']) {
 											$mainExten = $this->extenListRedirID[$exten][$line]['MainExten'];
 											$mainLineNum = $this->extenListRedirID[$exten][$line]['MainExtenLineNum'];
+											$this->log("Dial08: mainExten={$mainExten} mainLineNum={$mainLineNum}".PHP_EOL, self::logTrace);
 											if (false !== $destChannelID) {
 												$this->extenListChannelID[$destChannelID] = $this->answer['UniqueID'];
 											}
@@ -776,36 +938,8 @@ class asteriskWatch
 										}
 										$lineNum++;
 									}
+									$this->log("Dial09: exten={$exten} lineNum={$lineNum} mainExten={$mainExten} mainLineNum={$mainLineNum}".PHP_EOL, self::logTrace);
 									if ($pass == 1) {
-/*
-										# Есть исключение, когда звонок с неотслеживаемого расширения, нет возможности связать по UniqueID
-										# Единственный вариант - эвристика. В event смотрим поле CallerIDNum, оно равно вызывающей стороне,
-										# этот номер смотрим в extenListRedirID, берём там Status (он должен быть Ringing),
-										# берём MainExten и MainExtenLineNum, идём в extenList, там Status == Ringing && Direction == in && From == $from
-										# Если всё так, то это наш случай.
-										if (isset($this->answer['CallerIDNum']) && isset($this->extenListRedirID[$this->answer['CallerIDNum']])) {
-											foreach ($this->extenListRedirID[$this->answer['CallerIDNum']] as $line => $properties) {
-												if (self::extenStatusRinging == $properties['Status']) {
-													if (self::extenStatusRinging == $this->extenList[$properties['MainExten']][$properties['MainExtenLineNum']]['Status']
-															&& 'in' == $this->extenList[$properties['MainExten']][$properties['MainExtenLineNum']]['Direction']
-															&& $from == $this->extenList[$properties['MainExten']][$properties['MainExtenLineNum']]['From']) {
-Наверно надо не exten присваивать, а mainExten														$exten = $properties['MainExten'];
-														$lineNum = 0;
-														foreach ($this->extenListRedirID[$to] as $line2 => $properties2) {
-															if ($properties['MainExten'] == $properties2['MainExten']
-																	&& $properties['MainExtenLineNum'] == $properties2['MainExtenLineNum']
-																	&& self::extenStatusRinging == $properties2['Status']) {
-																break;
-															}
-															$lineNum++;
-														}
-														$mainExten = $properties['MainExten'];
-														$mainLineNum = $properties['MainExtenLineNum'];
-													}
-												}
-											}
-										}
-*/
 										$this->extenListCallID[$this->answer['UniqueID']]['MainExten'] = $mainExten;
 										$this->extenListCallID[$this->answer['UniqueID']]['MainExtenLineNum'] = $mainLineNum;
 										$this->extenListCallID[$this->answer['UniqueID']]['Exten'] = $exten;
@@ -822,6 +956,7 @@ class asteriskWatch
 												}
 												$secondLineNum++;
 											}
+											$this->log("Dial10: secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 											$this->extenList[$secondSideExten][$secondLineNum]['From'] = $this->extenList[$mainExten][$mainLineNum]['From'];
 											$this->extenList[$secondSideExten][$secondLineNum]['To'] = $this->extenList[$mainExten][$mainLineNum]['To'];
 											$this->extenList[$secondSideExten][$secondLineNum]['Direction'] = ('in' == $this->extenList[$mainExten][$mainLineNum]['Direction'] ? 'out' : 'in');
@@ -835,6 +970,8 @@ class asteriskWatch
 										}
 
 										$this->logStatus('Assign UniqueID to redir call and change status from redir.  Exten='.$exten.' secondSideExten='.$secondSideExten.' from='.$from.' to='.$to.' dialDirection='.$dialDirection.' lineNum='.$lineNum.' mainExten='.$mainExten.' mainLineNum='.$mainLineNum, self::logDebug);
+									} else {
+										$this->log('Skip EventBlock from Asterisk ->'.PHP_EOL, self::logDebug, $this->answer);
 									}
 									break;
 								}
@@ -859,6 +996,7 @@ class asteriskWatch
 										}
 									}
 								}
+								$this->log("Dial11: mainExten={$mainExten} mainLineNum={$mainLineNum} channelID={$channelID} exten={$exten} lineNum={$lineNum} count={$count}".PHP_EOL, self::logTrace);
 								# Тут может быть как основной ответ 'CANCEL', так и хрень типа 'CHANUNAVAIL'
 								if ('ANSWER' != $this->answer['DialStatus']) {
 									# Проверим завершился один из редиректов или весь разговор
@@ -882,14 +1020,15 @@ class asteriskWatch
 													|| self::extenStatusIdle != $this->extenList[$mainExten][$mainLineNum]['Status']) {
 											$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
 												'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'],
-												'EndCallStatusTxt' => "Local call is finished with '{$this->answer['DialStatus']}'(Idle)" ]);
+												'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 											# Повторим тоже самое для secondSideExten
 											$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 											$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+											$this->log("Dial12: secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 											if (isset($this->extenList[$secondSideExten][$secondLineNum])) {
 												$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum, 
 													'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'], 
-													'EndCallStatusTxt' => "Local call is finished with '{$this->answer['DialStatus']}'(Idle)" ]);
+													'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 												if (self::extenStatusIdle == $this->extenList[$secondSideExten][$secondLineNum]['Status']) {
 													$this->cleanExten($secondSideExten, $secondLineNum);
 												}
@@ -906,14 +1045,15 @@ class asteriskWatch
 									if ($this->answer['UniqueID'] == $this->extenList[$mainExten][$mainLineNum]['UniqueID']) {
 										$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
 												'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'],
-												'EndCallStatusTxt' => 'Call is finished (Idle)', ]);
+												'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 										# Повторим тоже самое для secondSideExten
 										$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 										$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+										$this->log("Dial13: secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 										if (isset($this->extenList[$secondSideExten][$secondLineNum]) && isset($this->extenListRedirID[$secondSideExten][$secondLineNum])) {
 											$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum,
 													'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'],
-													'EndCallStatusTxt' => 'Call is finished (Idle)' ]);
+													'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 											$this->cleanExten($secondSideExten, $secondLineNum);
 										}
 										$this->saveCDR(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
@@ -940,28 +1080,40 @@ class asteriskWatch
 												$this->extenList[$mainExten][$mainLineNum]['Status'] = self::extenStatusInUseRedir;
 												$this->extenList[$mainExten][$mainLineNum]['StatusTxt'] = $this->getStatusTxt(self::extenStatusInUseRedir);
 											}
+											if (isset($this->answer['ConnectedLineNum'])) {
+												$answeredExten = $this->extractExten($this->answer['ConnectedLineNum']);
+												if ($answeredExten === false) {
+													$answeredExten = $exten;
+												}
+											} else {
+												$answeredExten = $exten;
+											}
+											if (isset($this->extenList[$mainExten][$mainLineNum])) {
+												if ($this->extenList[$mainExten][$mainLineNum]['From'] == $answeredExten) {
+													$answeredExten = $this->extenList[$mainExten][$mainLineNum]['To'];
+												}
+											}
 											if ('' == $this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom']) {
 												$this->extenList[$mainExten][$mainLineNum]['TalkTimeFrom'] = time();
-												$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $exten;
+												$this->extenList[$mainExten][$mainLineNum]['AnsweredExten'] = $answeredExten;
 											}
-											$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
-												'ConnRedir' => $exten ]);
+											$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum ]);
 											# Повторим тоже самое для secondSideExten
 											$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 											$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+											$this->log("Dial14: secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 											if (isset($this->extenList[$secondSideExten][$secondLineNum])) {
 												if ('' == $this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom']) {
 													$this->extenList[$secondSideExten][$secondLineNum]['TalkTimeFrom'] = time();
-													$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $exten;
+													$this->extenList[$secondSideExten][$secondLineNum]['AnsweredExten'] = $answeredExten;
 												}
 												$this->extenList[$secondSideExten][$secondLineNum]['Status'] = $this->extenList[$mainExten][$mainLineNum]['Status'];
 												$this->extenList[$secondSideExten][$secondLineNum]['StatusTxt'] = $this->getStatusTxt($this->extenList[$mainExten][$mainLineNum]['Status']);
-												$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum,
-													'ConnRedir' => $exten ]);
+												$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum ]);
 											}
 										}
 										$this->cleanRedirLine($this->answer['UniqueID'], $exten, $lineNum);
-										$this->logStatus('Close one of additional Redir exten. mainExten='.$mainExten.' mainLineNum='.$mainLineNum.' exten='.$exten.' LineNum='.$lineNum.' count='.$count, self::logDebug);
+										$this->logStatus('Close one of additional Redir exten. mainExten='.$mainExten.' mainLineNum='.$mainLineNum.' exten='.$exten.' LineNum='.$lineNum.' count='.$count.' answeredExten='.$answeredExten, self::logDebug);
 
 										break;
 									}
@@ -969,14 +1121,16 @@ class asteriskWatch
 									# Вызов завершён
 									$this->sendDialEvent(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
 										'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'], 
-										'EndCallStatusTxt' => 'Call is finished with "Answer"(Idle)' ]);
+										'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 									# Повторим тоже самое для secondSideExten
 									$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 									$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
-									if (isset($this->extenList[$secondSideExten][$secondLineNum])) {
+									$this->log("Dial15: secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
+									# Отправляем только если вторая сторона есть и ей ещё не отправляли ранее
+									if (isset($this->extenList[$secondSideExten][$secondLineNum]) && $this->extenList[$secondSideExten][$secondLineNum]['Status'] != self::extenStatusIdle) {
 										$this->sendDialEvent(['Exten' => $secondSideExten, 'LineNum' => $secondLineNum,
 											'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'],
-											'EndCallStatusTxt' => 'Call is finished with "Answer"(Idle)' ]);
+											'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 										$this->cleanExten($secondSideExten, $secondLineNum);
 									}
 									$this->saveCDR(['Exten' => $mainExten, 'LineNum' => $mainLineNum,
@@ -992,13 +1146,26 @@ class asteriskWatch
 
 						break;
 				}
+				/*
+				 * Call tick user function
+				 */
+				if (isset($this->callbackFunc['tick'])) {
+					try {
+						call_user_func($this->callbackFunc['tick']);
+					} catch (Exception $e) {
+						$this->log($e->getMessage(), self::logInfo);
+					}
+				}
 			}
-			fclose($this->fp);
+			if (is_resource($this->fp)) {
+				fclose($this->fp);
+			}
 			$this->connect();
 		}
 	}
 
 	private function cleanRedirLine($uniqueID, $exten, $lineNum) {
+		$this->log("clearRedirLine: uniqueID={$uniqueID} exten={$exten} lineNum={$lineNum}".PHP_EOL, self::logTrace);
 		if (0 == $uniqueID) {
 			if (isset($this->extenListRedirID[$exten][$lineNum])) {
 				$mainExten = $this->extenListRedirID[$exten][$lineNum]['MainExten'];
@@ -1029,17 +1196,17 @@ class asteriskWatch
 			if (isset($this->answer['DialStatus'])) {
 				$status = $this->answer['DialStatus'];
 			} else {
-				$status = 'extenStatusIdle';
+				$status = 'REDIREND';
 			}
 			foreach ($this->extenListRedirID[$exten] as $line => $properties) {
-				if ($mainExten == $properties['MainExten'] && $mainLineNum == $properties['MainExtenLineNum']) {
+				if ($mainExten == $properties['MainExten'] && $mainLineNum == $properties['MainExtenLineNum'] && $uniqueID == $properties['UniqueID']) {
 					if (isset($this->extenList[$exten][$lineNum]) && self::extenStatusIdle != $this->extenList[$exten][$lineNum]['Status']
 							&& !($exten == $mainExten && $line == $mainLineNum)) {
 						if (!($exten == $this->extenList[$exten][$lineNum]['SecondSideExten'] 
 								&& $line == $this->extenList[$exten][$lineNum]['SecondSideLineNum'])) {
 							$this->sendDialEvent(['Exten' => $exten, 'LineNum' => $lineNum,
 									'CallTimeTo' => time(), 'EndCallStatus' => $status,
-									'EndCallStatusTxt' => 'Redir exten line end' ]);
+									'EndCallStatusTxt' => self::DialStatusTxt[$status] ]);
 							$this->cleanExten($exten, $lineNum);
 						}
 					}
@@ -1058,6 +1225,7 @@ class asteriskWatch
 		$mainLineNum = $this->extenListCallID[$uniqueID]['MainExtenLineNum'];
 		$secondSideExten = $this->extenList[$mainExten][$mainLineNum]['SecondSideExten'];
 		$secondLineNum = $this->extenList[$mainExten][$mainLineNum]['SecondSideLineNum'];
+		$this->log("cleanAllLine: uniqueID={$uniqueID} mainExten={$mainExten} mainLineNum={$mainLineNum} secondSideExten={$secondSideExten} secondLineNum={$secondLineNum}".PHP_EOL, self::logTrace);
 		# Если есть другие отслеживаемые exten, то их тоже оповестим
 		foreach ($this->extenList as $to => $properties) {
 			foreach ($properties as $line => $lineProperties) {
@@ -1066,7 +1234,7 @@ class asteriskWatch
 						if (!($to == $secondSideExten && $line == $secondLineNum)) {
 							$this->sendDialEvent(['Exten' => $to, 'LineNum' => $line, 
 									'CallTimeTo' => time(), 'EndCallStatus' => $this->answer['DialStatus'], 
-									'EndCallStatusTxt' => "Local call is finished with '{$this->answer['DialStatus']}'(Idle)" ]);
+									'EndCallStatusTxt' => self::DialStatusTxt[$this->answer['DialStatus']] ]);
 						}
 					}
 				}
@@ -1127,28 +1295,32 @@ class asteriskWatch
 	}
 	
 	private function cleanExten($exten, $lineNum) {
-		if (!isset($this->extenList[$exten][$lineNum]) || 1 >= count($this->extenList[$exten])) {
-			$this->extenList[$exten][$lineNum]['From'] = '';
-			$this->extenList[$exten][$lineNum]['To'] = '';
-			$this->extenList[$exten][$lineNum]['Direction'] = '';
-			$this->extenList[$exten][$lineNum]['CallTimeFrom'] = '';
-			$this->extenList[$exten][$lineNum]['TalkTimeFrom'] = '';
-			$this->extenList[$exten][$lineNum]['SecondSideExten'] = '';
-			$this->extenList[$exten][$lineNum]['SecondSideLineNum'] = '';
-			$this->extenList[$exten][$lineNum]['CallerIDName'] = '';
-			$this->extenList[$exten][$lineNum]['Status'] = self::extenStatusIdle;
-			$this->extenList[$exten][$lineNum]['StatusTxt'] = $this->getStatusTxt($this->extenList[$exten][$lineNum]['Status']);
-			$this->extenList[$exten][$lineNum]['UniqueID'] = '';
-			$this->extenList[$exten][$lineNum]['AnsweredExten'] = '';
-			if (0 != $lineNum) {
-				if (!isset($this->extenList[$exten][0]) || $this->extenList[$exten][0]['Status'] == self::extenStatusIdle) {
-					$this->extenList[$exten][0] = $this->extenList[$exten][$lineNum];
-					unset($this->extenList[$exten][$lineNum]);
-				}
+		$this->log("cleanExten: exten={$exten} lineNum={$lineNum}".PHP_EOL, self::logTrace);
+		$this->extenList[$exten][$lineNum]['From'] = '';
+		$this->extenList[$exten][$lineNum]['To'] = '';
+		$this->extenList[$exten][$lineNum]['Direction'] = '';
+		$this->extenList[$exten][$lineNum]['CallTimeFrom'] = '';
+		$this->extenList[$exten][$lineNum]['TalkTimeFrom'] = '';
+		$this->extenList[$exten][$lineNum]['SecondSideExten'] = '';
+		$this->extenList[$exten][$lineNum]['SecondSideLineNum'] = '';
+		$this->extenList[$exten][$lineNum]['CallerIDName'] = '';
+		$this->extenList[$exten][$lineNum]['Status'] = self::extenStatusIdle;
+		$this->extenList[$exten][$lineNum]['StatusTxt'] = $this->getStatusTxt($this->extenList[$exten][$lineNum]['Status']);
+		$this->extenList[$exten][$lineNum]['UniqueID'] = '';
+		$this->extenList[$exten][$lineNum]['AnsweredExten'] = '';
+		if (self::magicLineNum == $lineNum) {
+			return;
+		}
+		$maxUsedLine = $lineNum;
+		foreach ($this->extenList[$exten] as $line => $properties) {
+			if ($maxUsedLine < $line && $properties['Status'] != self::extenStatusIdle) {
+				$maxUsedLine = $line;
 			}
 		}
-		else {
-			unset($this->extenList[$exten][$lineNum]);
+		foreach ($this->extenList[$exten] as $line => $properties) {
+			if ($maxUsedLine < $line) {
+				unset($this->extenList[$exten][$line]);
+			}
 		}
 	}
 
@@ -1158,15 +1330,23 @@ class asteriskWatch
 			foreach ($event as $key => $value) {
 				$ret[$key] = $value;
 			}
-		}
-		else {
+		} else {
 			$ret = $event;
 		}
 		if (isset($event['TalkTimeFrom']) && isset($event['EndCallStatus']) && $event['TalkTimeFrom'] == '' && $event['EndCallStatus'] == 'ANSWER') {
 			$event['EndCallStatus'] = 'VOICEMAIL';
 		}
-		$this->log("saveCDR ->\n", $ret, self::logInfo, 1);
-		return $ret;
+		$this->log("saveCDR ->\n", self::logInfo, $ret, 1);
+		/*
+		 * Call 'saveCDR' user function
+		 */
+		if (isset($this->callbackFunc['saveCDR'])) {
+			try {
+				call_user_func_array($this->callbackFunc['saveCDR'], array($ret));
+			} catch (Exception $e) {
+				$this->log($e->getMessage(), self::logInfo);
+			}
+		}
 	}
 
 	private function sendDialEvent($event) {
@@ -1175,8 +1355,7 @@ class asteriskWatch
 			foreach ($event as $key => $value) {
 				$ret[$key] = $value;
 			}
-		}
-		else {
+		} else {
 			$ret = $event;
 		}
 		if (isset($ret['Exten']) && isset($ret['LineNum']) 
@@ -1194,28 +1373,39 @@ class asteriskWatch
 				}
 			}
 		}
-		$this->log("sendDialEvent ->\n", $ret, self::logInfo, 1);
-		return $ret;
+		$this->log("sendDialEvent ->\n", self::logInfo, $ret, 1);
+		/*
+		 * Call 'sendDialEvent' user function
+		 */
+		if (isset($this->callbackFunc['sendDialEvent'])) {
+			try {
+				call_user_func_array($this->callbackFunc['sendDialEvent'], array($ret));
+			} catch (Exception $e) {
+				$this->log($e->getMessage(), self::logInfo);
+			}
+		}
 	}
 
 	private function extractExten($str) {
+		$to = false;
 		if (0 === strncmp($str, 'SIP', 3)) {
 			$to = substr($str, 4, strrpos($str, '-') - 4);
 		} elseif (0 === strncmp($str, 'Local', 5)) {
-			$to = substr($str, 6, strpos($str, '@') - 6);
-			if (0 === strncmp($to, 'FMPR', 4)) {
-				$to = substr($to, 5);
-			} elseif (0 === strncmp($to, 'FMGL', 4)) {
-				$to = substr($to, 5);
-			} elseif (0 === strncmp($to, 'LC', 2)) {
-				$to = substr($to, 3);
-			}
+			$str = substr($str, 6, strpos($str, '@') - 6);
+		}
+		if (is_numeric($str)) {
+			return $str;
+		}
+		if (0 === strncmp($str, 'FMPR', 4)) {
+			$to = substr($str, 5);
+		} elseif (0 === strncmp($str, 'FMGL', 4)) {
+			$to = substr($str, 5);
+		} elseif (0 === strncmp($str, 'LC', 2)) {
+			$to = substr($str, 3);
+		}
 
-			if (strpos($to, '#')) {
-				$to = substr($to, 0, strpos($to, '#'));
-			}
-		} else {
-			$to = false;
+		if ($to !== false && strpos($to, '#')) {
+			$to = substr($to, 0, strpos($to, '#'));
 		}
 
 		return $to;
@@ -1226,9 +1416,12 @@ class asteriskWatch
 			return false;
 		}
 		if (false === ($posEnd = strpos($str, ';', $posStart))) {
-			return substr($str, $posStart+1);
-		}
-		else {
+			if (false === ($posEnd = strpos($str, '<ZOMBIE>', $posStart))) {
+				return substr($str, $posStart+1);
+			} else {
+				return substr($str, $posStart+1, $posEnd-$posStart-1);
+			}
+		} else {
 			return substr($str, $posStart+1, $posEnd-$posStart-1);
 		}
 	}
@@ -1281,25 +1474,26 @@ class asteriskWatch
 	}
 	
 	private function logStatus($str = '', $debLvl = self::logDebug) {
-		$this->log('=== Status start ========================================================='.PHP_EOL, '', $debLvl);
-		$this->log('EventBlock from Asterisk ->'.PHP_EOL, $this->answer, $debLvl, 1);
+		$this->log('=== Status start ========================================================='.PHP_EOL, $debLvl);
+		$this->log('EventBlock from Asterisk ->'.PHP_EOL, $debLvl, $this->answer, 1);
 		if ('' != $str) {
-			$this->log($str.PHP_EOL, '', $debLvl);
+			$this->log($str.PHP_EOL, $debLvl);
 		}
-		$this->log('extenListChannelID: '.PHP_EOL, $this->extenListChannelID, $debLvl);
-		$this->log('extenListCallID: '.PHP_EOL, $this->extenListCallID, $debLvl);
-		$this->log('extenListRedirID: '.PHP_EOL, $this->extenListRedirID, $debLvl);
-		$this->log('extenList: '.PHP_EOL, $this->extenList, $debLvl);
-		$this->log('=== Status end ==========================================================='.PHP_EOL, '', $debLvl);
+		$this->log('extenListCheckBusy: '.PHP_EOL, $debLvl, $this->extenListCheckBusy);
+		$this->log('extenListChannelID: '.PHP_EOL, $debLvl, $this->extenListChannelID);
+		$this->log('extenListCallID: '.PHP_EOL, $debLvl, $this->extenListCallID);
+		$this->log('extenListRedirID: '.PHP_EOL, $debLvl, $this->extenListRedirID);
+		$this->log('extenList: '.PHP_EOL, $debLvl, $this->extenList);
+		$this->log('=== Status end ==========================================================='.PHP_EOL, $debLvl);
 	}
 
-	private function log($str, $log = '', $debLvl = self::logInfo, $indent = 0) {
+	private function log($str, $debLvl = self::logInfo, $debValue = '', $indent = 0) {
 		if ($debLvl > $this->Debug) {
 			return;
 		}
 		echo date('[Y-m-d H:i:s]').' '.$str;
-		if ($log != '') {
-			$this->print_r_reverse(print_r($log,true), $indent);
+		if ($debValue != '') {
+			$this->print_r_reverse(print_r($debValue, true), $indent);
 			echo "\n";
 		}
 	}
@@ -1323,7 +1517,7 @@ class asteriskWatch
 		fwrite($this->fp, "\r\n");
 		$this->getAsteriskBlock();
 		if ('Success' != $this->answer['Response']) {
-			$this->log('Auth failed');
+			$this->log('Auth failed', self::logInfo);
 			fclose($this->fp);
 			$this->fp = false;
 		}
@@ -1379,8 +1573,7 @@ class asteriskWatch
 					if ($lvl != 0) {
 						echo "\n".str_repeat("\t", $indent+$lvl).'[';
 					}
-				}
-				elseif ($ret == 1) {
+				} elseif ($ret == 1) {
 					echo ",\n".str_repeat("\t", $indent+$lvl);
 					if ($res == 0) {
 					}
