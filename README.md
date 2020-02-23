@@ -72,13 +72,44 @@ $saveCDR = function ($event) {
 	global $endCallStatus, $direction;
 	
 	$pgsql = new db($USER, $PASS);
-	$pgsql->prepare_sql('INSERT INTO phoneEventCDR (fromNum, toNum, direction, endCallStatus, callTimeFrom, talkTimeFrom,
-					callTimeTo, answeredExten, exten, lineNum, secondSideExten, secondSideLineNum) 
-				VALUES (?, ?, ?::boolean, ?, to_timestamp(?), to_timestamp(?), to_timestamp(?), ?, ?, ?, ?, ?)', array($event['From'], $event['To'], $direction[$event['Direction']],
-					$endCallStatus[$event['EndCallStatus']], $event['CallTimeFrom'], 
-					($event['TalkTimeFrom'] != '' ? $event['TalkTimeFrom'] : NULL), $event['CallTimeTo'],
-					$event['AnsweredExten'], $event['Exten'], $event['LineNum'],
-					$event['SecondSideExten'], $event['SecondSideLineNum']), 'num');
+	$pgsql->prepare_sql('INSERT INTO phoneEventCDR (
+					fromNum,
+					toNum, 
+					direction, 
+					endCallStatus, 
+					callTimeFrom, 
+					talkTimeFrom,
+					callTimeTo, 
+					answeredExten, 
+					exten, 
+					lineNum, 
+					secondSideExten, 
+					secondSideLineNum) 
+				VALUES (
+					?, 
+					?, 
+					?::boolean, 
+					?, 
+					to_timestamp(?), 
+					to_timestamp(?), 
+					to_timestamp(?), 
+					?, 
+					?, 
+					?, 
+					?, 
+					?)', 
+			array($event['From'], 
+					$event['To'], 
+					$direction[$event['Direction']],
+					$endCallStatus[$event['EndCallStatus']], 
+					$event['CallTimeFrom'], 
+					($event['TalkTimeFrom'] != '' ? $event['TalkTimeFrom'] : NULL), 
+					$event['CallTimeTo'],
+					$event['AnsweredExten'], 
+					$event['Exten'], 
+					$event['LineNum'],
+					$event['SecondSideExten'], 
+					$event['SecondSideLineNum']), 'num');
 	unset($pgsql);
 };
 $server->setFuncSaveCDR($saveCDR);
@@ -107,6 +138,7 @@ $server->watch();
 
 ## Example logs
 
+```log
 [2020-01-01 00:04:56] sendDialEvent ->
 	'From' => '84951608738',
 	'To' => '135',
@@ -140,6 +172,7 @@ $server->watch();
     'LineNum' => '0',
     'CallTimeTo' => '1582466714',
     'EndCallStatus' => 'ANSWER'
+```
 
 ## LICENSE
 
