@@ -189,7 +189,7 @@ class asteriskWatch
 
 	public function setFuncSendDialEvent($func) {
         if (!is_callable($func)) {
-            $this->log(new Exception("function not callable".PHP_EOL), self::logInfo);
+            $this->log(new Exception("function is not callable (sendDialEvent)".PHP_EOL), self::logInfo);
             return false;
         }
 		$this->callbackFunc['sendDialEvent'] = $func;
@@ -197,7 +197,7 @@ class asteriskWatch
 	
 	public function setFuncSaveCDR($func) {
         if (!is_callable($func)) {
-            $this->log(new Exception("function not callable".PHP_EOL), self::logInfo);
+            $this->log(new Exception("function is not callable (saveCDR)".PHP_EOL), self::logInfo);
             return false;
         }
 		$this->callbackFunc['saveCDR'] = $func;
@@ -205,34 +205,28 @@ class asteriskWatch
 	
 	public function setFuncTick($func) {
         if (!is_callable($func)) {
-            $this->log(new Exception("function not callable".PHP_EOL), self::logInfo);
+            $this->log(new Exception("function is not callable (tick)".PHP_EOL), self::logInfo);
             return false;
         }
 		$this->callbackFunc['tick'] = $func;
 	}
 
-	public function getLineFullStatus($exten) {
-		if (isset($this->extenList[$exten]))
-			return $this->extenList[$exten];
-		else
-			return false;
-	}
-	
-	public function getLineStatus($exten) {
-		if (isset($this->extenList[$exten]))
-			return $this->extenList[$exten]['Status'];
-		else
-			return false;
+	public function setFuncGetAllExtenStatus($func) {
+        if (!is_callable($func)) {
+            $this->log(new Exception("function is not callable (getAllExtenStatus)".PHP_EOL), self::logInfo);
+            return false;
+        }
+		$this->callbackFunc['getAllExtenStatus'] = $func;
 	}
 
-	public function getAllLineFullStatus() {
-		return $this->extenList;
+	public function setFuncGetAllLine0Status($func) {
+        if (!is_callable($func)) {
+            $this->log(new Exception("function is not callable (getAllLine0Status)".PHP_EOL), self::logInfo);
+            return false;
+        }
+		$this->callbackFunc['getAllLine0Status'] = $func;
 	}
 
-	public function getAllLineStatus() {
-		return array_combine(array_keys($this->extenList), array_column($this->extenList, 'Status'));
-	}
-	
 	
 	public function watch()
 	{
@@ -1343,7 +1337,7 @@ class asteriskWatch
 		foreach ($this->extenList[$exten] as $line => $properties) {
 			if ($maxUsedLine < $line) {
 				unset($this->extenList[$exten][$line]);
-			}
+            }
 		}
 	}
 
@@ -1403,6 +1397,26 @@ class asteriskWatch
 		if (isset($this->callbackFunc['sendDialEvent'])) {
 			try {
 				call_user_func_array($this->callbackFunc['sendDialEvent'], array($ret));
+			} catch (Exception $e) {
+				$this->log($e->getMessage(), self::logInfo);
+			}
+		}
+		/*
+		 * Call getAllExtenStatus user functions
+		 */
+		if (isset($this->callbackFunc['getAllExtenStatus'])) {
+			try {
+				call_user_func_array($this->callbackFunc['getAllExtenStatus'], array($ret, $this->extenList));
+			} catch (Exception $e) {
+				$this->log($e->getMessage(), self::logInfo);
+			}
+		}
+		/*
+		 * Call getAllLine0Status user functions
+		 */
+		if (isset($this->callbackFunc['getAllLine0Status'])) {
+			try {
+				call_user_func_array($this->callbackFunc['getAllLine0Status'], array($ret, array_combine(array_keys($this->extenList), array_column(array_column($this->extenList, 0), 'Status'))));
 			} catch (Exception $e) {
 				$this->log($e->getMessage(), self::logInfo);
 			}

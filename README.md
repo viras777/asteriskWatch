@@ -132,6 +132,32 @@ $tick = function () use ($server) {
 };
 $server->setFuncTick($tick);
 
+$redis = new Redis();
+$redis->connect($redis_host);
+$redis->select($redis_db);
+
+$getAllLine0Status = function ($event, $allLine0Status) use ($redis) {
+    if (isset($event['EndCallStatus'])) {
+        $event['Status'] = asteriskWatch::extenStatusIdle;
+    }
+    if (isset($event['Exten'])) {
+        if (isset($event['LineNum']) && $event['LineNum'] > 0) {
+            if (isset($event['Status']) && $event['Status'] != asteriskWatch::extenStatusIdle
+                        && $allLine0Status[$event['Exten']] == asteriskWatch::extenStatusIdle ) {
+                $allLine0Status[$event['Exten']] = $event['Status'];
+            }
+        }
+        else {
+            $allLine0Status[$event['Exten']] = $event['Status'];
+        }
+    }
+    $redis->del('sys_phoneStatus');
+    //$redis->hMSet('sys_phoneStatus', $allLine0Status);
+    $redis->hMSet('sys_phoneStatus', array_diff($allLine0Status, [asteriskWatch::extenStatusIdle]));
+    $redis->expire('sys_phoneStatus', 60*60*24);
+};
+$server->setFuncGetAllLine0Status($getAllLine0Status);
+
 $server->watch();
 
 ```
