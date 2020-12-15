@@ -1337,7 +1337,7 @@ class asteriskWatch
 		foreach ($this->extenList[$exten] as $line => $properties) {
 			if ($maxUsedLine < $line) {
 				unset($this->extenList[$exten][$line]);
-            }
+			}
 		}
 	}
 
