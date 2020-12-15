@@ -28,7 +28,7 @@ class asteriskWatch
 	 *
 	 * @var string
 	 */
-	const VERSION = '1.4.5';
+	const VERSION = '1.5.1';
 	
 	/**
 	 * No logging.
@@ -210,6 +210,29 @@ class asteriskWatch
         }
 		$this->callbackFunc['tick'] = $func;
 	}
+
+	public function getLineFullStatus($exten) {
+		if (isset($this->extenList[$exten]))
+			return $this->extenList[$exten];
+		else
+			return false;
+	}
+	
+	public function getLineStatus($exten) {
+		if (isset($this->extenList[$exten]))
+			return $this->extenList[$exten]['Status'];
+		else
+			return false;
+	}
+
+	public function getAllLineFullStatus() {
+		return $this->extenList;
+	}
+
+	public function getAllLineStatus() {
+		return array_combine(array_keys($this->extenList), array_column($this->extenList, 'Status'));
+	}
+	
 	
 	public function watch()
 	{
