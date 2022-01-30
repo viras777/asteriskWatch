@@ -28,7 +28,7 @@ class asteriskWatch
 	 *
 	 * @var string
 	 */
-	const VERSION = '1.5.1';
+	const VERSION = '1.6';
 	
 	/**
 	 * No logging.
@@ -245,7 +245,9 @@ class asteriskWatch
 			# Main loop
 			while (is_resource($this->fp) && !feof($this->fp)) {
 				$this->actionID = '';
-				$this->getAsteriskBlock();
+				if ($this->getAsteriskBlock() === false) {
+					break;
+				}
 				switch ($this->answer['Event']) {
 					case 'Newchannel':
 						if ($this->answer['CallerIDNum'] == '' || $this->answer['Exten'] == ''
@@ -1169,7 +1171,7 @@ class asteriskWatch
 				if (isset($this->callbackFunc['tick'])) {
 					try {
 						call_user_func($this->callbackFunc['tick']);
-					} catch (Exception $e) {
+					} catch (\Throwable $e) {
 						$this->log($e->getMessage(), self::logInfo);
 					}
 				}
@@ -1337,7 +1339,7 @@ class asteriskWatch
 		foreach ($this->extenList[$exten] as $line => $properties) {
 			if ($maxUsedLine < $line) {
 				unset($this->extenList[$exten][$line]);
-			}
+            }
 		}
 	}
 
@@ -1360,7 +1362,7 @@ class asteriskWatch
 		if (isset($this->callbackFunc['saveCDR'])) {
 			try {
 				call_user_func_array($this->callbackFunc['saveCDR'], array($ret));
-			} catch (Exception $e) {
+			} catch (\Throwable $e) {
 				$this->log($e->getMessage(), self::logInfo);
 			}
 		}
@@ -1397,7 +1399,7 @@ class asteriskWatch
 		if (isset($this->callbackFunc['sendDialEvent'])) {
 			try {
 				call_user_func_array($this->callbackFunc['sendDialEvent'], array($ret));
-			} catch (Exception $e) {
+			} catch (\Throwable $e) {
 				$this->log($e->getMessage(), self::logInfo);
 			}
 		}
@@ -1407,7 +1409,7 @@ class asteriskWatch
 		if (isset($this->callbackFunc['getAllExtenStatus'])) {
 			try {
 				call_user_func_array($this->callbackFunc['getAllExtenStatus'], array($ret, $this->extenList));
-			} catch (Exception $e) {
+			} catch (\Throwable $e) {
 				$this->log($e->getMessage(), self::logInfo);
 			}
 		}
@@ -1417,7 +1419,7 @@ class asteriskWatch
 		if (isset($this->callbackFunc['getAllLine0Status'])) {
 			try {
 				call_user_func_array($this->callbackFunc['getAllLine0Status'], array($ret, array_combine(array_keys($this->extenList), array_column(array_column($this->extenList, 0), 'Status'))));
-			} catch (Exception $e) {
+			} catch (\Throwable $e) {
 				$this->log($e->getMessage(), self::logInfo);
 			}
 		}
@@ -1465,6 +1467,7 @@ class asteriskWatch
 
 	private function getAsteriskBlock() {
 		$ret = [];
+		$this->answer = $ret;
 		while (true) {
 			while (!feof($this->fp)) {
 				if (false === ($line = fgets($this->fp))) {
@@ -1477,6 +1480,9 @@ class asteriskWatch
 					continue;
 				}
 				$ret[substr($line, 0, $pos)] = trim(substr($line, $pos + 1));
+			}
+			if (feof($this->fp)) {
+				return false;
 			}
 			if (empty($ret)) {
 				continue;
@@ -1539,8 +1545,8 @@ class asteriskWatch
 		$errno = '';
 		$errstr = '';
 
-		if (false === ($this->fp = fsockopen($this->host, $this->port, $errno, $errstr, 3))) {
-			return;
+		while (false === ($this->fp = @fsockopen($this->host, $this->port, $errno, $errstr, 3))) {
+			sleep (1);
 		}
 		stream_set_timeout($this->fp, 0, 500000);
 		$this->actionID = rand();
