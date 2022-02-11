@@ -28,7 +28,7 @@ class asteriskWatch
 	 *
 	 * @var string
 	 */
-	const VERSION = '1.6';
+	const VERSION = '1.6.1';
 	
 	/**
 	 * No logging.
@@ -168,7 +168,6 @@ class asteriskWatch
 		$this->port = $port;
 		$this->user = $user;
 		$this->pass = $pass;
-		return $this->connect();
 	}
 
 	public function setExtenList($newSet) {
@@ -231,6 +230,10 @@ class asteriskWatch
 	public function watch()
 	{
 		while (true) {
+			if (false == $this->connect()) {
+				break;
+			}
+			$this->logStatus('Connect to asterisk - DONE', self::logInfo);
 			$this->extenListChannelID = [];
 			$this->extenListCallID = [];
 			$this->extenListRedirID = [];
@@ -240,7 +243,7 @@ class asteriskWatch
 			foreach ($this->initExten as $exten) {
 				$this->cleanExten($exten, 0);
 			}
-			$this->logStatus('Start from here.', self::logDebug);
+			$this->logStatus('Start main loop', self::logInfo);
 
 			# Main loop
 			while (is_resource($this->fp) && !feof($this->fp)) {
@@ -1179,7 +1182,6 @@ class asteriskWatch
 			if (is_resource($this->fp)) {
 				fclose($this->fp);
 			}
-			$this->connect();
 		}
 	}
 
@@ -1546,6 +1548,7 @@ class asteriskWatch
 		$errstr = '';
 
 		while (false === ($this->fp = @fsockopen($this->host, $this->port, $errno, $errstr, 3))) {
+			$this->log('Cant connect', self::logDebug);
 			sleep (1);
 		}
 		stream_set_timeout($this->fp, 0, 500000);
@@ -1563,7 +1566,9 @@ class asteriskWatch
 			$this->log('Auth failed', self::logInfo);
 			fclose($this->fp);
 			$this->fp = false;
+			return false;
 		}
+		return true;
 	}
 
 	/* Modified function from https://www.php.net/manual/ru/function.print-r.php#121259 */
