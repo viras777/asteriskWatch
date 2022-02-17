@@ -16,7 +16,7 @@
  * @copyright Sergey<viras@yandex.ru>
  * @license   https://opensource.org/licenses/Apache-2.0
  */
-//namespace asteriskWatch;
+namespace asteriskWatch;
 
 /**
  * asteriskWatch class
