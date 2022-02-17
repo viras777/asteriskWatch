@@ -16,7 +16,7 @@
  * @copyright Sergey<viras@yandex.ru>
  * @license   https://opensource.org/licenses/Apache-2.0
  */
-namespace asteriskWatch;
+//namespace asteriskWatch;
 
 /**
  * asteriskWatch class
@@ -28,7 +28,7 @@ class asteriskWatch
 	 *
 	 * @var string
 	 */
-	const VERSION = '1.6.1';
+	const VERSION = '1.6.2';
 	
 	/**
 	 * No logging.
@@ -47,6 +47,9 @@ class asteriskWatch
 	 */
 	public const logTrace = 3;
 
+	public const timeoutSec = 1;
+	public const timeoutUsec = 0;
+	
 	# -1 = Екстеншен не найден
 	# 0 = Idle
 	# 1 = Используется (In Use)
@@ -233,7 +236,7 @@ class asteriskWatch
 			if (false == $this->connect()) {
 				break;
 			}
-			$this->logStatus('Connect to asterisk - DONE', self::logInfo);
+			$this->log('Connect to asterisk - DONE', self::logInfo);
 			$this->extenListChannelID = [];
 			$this->extenListCallID = [];
 			$this->extenListRedirID = [];
@@ -251,7 +254,7 @@ class asteriskWatch
 				if ($this->getAsteriskBlock() === false) {
 					break;
 				}
-				switch ($this->answer['Event']) {
+				switch ($this->answer['Event'] ?? '') {
 					case 'Newchannel':
 						if ($this->answer['CallerIDNum'] == '' || $this->answer['Exten'] == ''
 								|| isset($this->extenListCheckBusy[$this->answer['Uniqueid']])) {
@@ -1471,19 +1474,30 @@ class asteriskWatch
 		$ret = [];
 		$this->answer = $ret;
 		while (true) {
-			while (!feof($this->fp)) {
-				if (false === ($line = fgets($this->fp))) {
-					continue;
+			while (is_resource($this->fp) && !feof($this->fp)) {
+				$fpRead = array($this->fp);
+				$fpWrite = NULL;
+				$fpExcept = NULL;
+				if (false === ($numChangedStreams = stream_select($fpRead, $fpWrite, $fpExcept, self::timeoutSec, self::timeoutUsec))) {
+					return false;
+
+				} elseif ($numChangedStreams == 0) {
+					$this->ping();
+
+				} else {
+					if (false === ($line = fgets($this->fp))) {
+						continue;
+					}
+					if ('' == trim($line)) {
+						break;
+					}
+					if (false === ($pos = strpos($line, ':'))) {
+						continue;
+					}
+					$ret[substr($line, 0, $pos)] = trim(substr($line, $pos + 1));
 				}
-				if ('' == trim($line)) {
-					break;
-				}
-				if (false === ($pos = strpos($line, ':'))) {
-					continue;
-				}
-				$ret[substr($line, 0, $pos)] = trim(substr($line, $pos + 1));
 			}
-			if (feof($this->fp)) {
+			if (!is_resource($this->fp) || feof($this->fp)) {
 				return false;
 			}
 			if (empty($ret)) {
@@ -1551,7 +1565,7 @@ class asteriskWatch
 			$this->log('Cant connect', self::logDebug);
 			sleep (1);
 		}
-		stream_set_timeout($this->fp, 0, 500000);
+		stream_set_timeout($this->fp, self::timeoutSec, self::timeoutUsec);
 		$this->actionID = rand();
 		# Open connetion and auth
 		fwrite($this->fp, "Action: login\r\n");
@@ -1569,6 +1583,13 @@ class asteriskWatch
 			return false;
 		}
 		return true;
+	}
+
+	private function ping() {
+		$this->log('ping', self::logTrace);
+		fwrite($this->fp, "Action: ping\r\n");
+		fwrite($this->fp, "ActionID: {$this->actionID}\r\n");
+		fwrite($this->fp, "\r\n");
 	}
 
 	/* Modified function from https://www.php.net/manual/ru/function.print-r.php#121259 */
